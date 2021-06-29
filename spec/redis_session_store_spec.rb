@@ -152,69 +152,14 @@ describe RedisSessionStore do
     end
   end
 
-  describe 'rack 1.45 compatibility' do
-    # Rack 1.45 (which Rails 3.2.x depends on) uses the return value of
-    # set_session to set the cookie value.  See:
-    # https://github.com/rack/rack/blob/1.4.5/lib/rack/session/abstract/id.rb
-
-    let(:env)          { double('env') }
-    let(:session_id)   { 12_345 }
-    let(:session_data) { double('session_data') }
-    let(:options)      { { expire_after: 123 } }
-
-    context 'when successfully persisting the session' do
-      it 'returns the session id' do
-        expect(store.send(:set_session, env, session_id, session_data, options))
-          .to eq(session_id)
-      end
+  describe 'when skipping identical writes' do
+    let :options do
+      {
+        skip_identical_writes: true
+      }
     end
 
-    context 'when unsuccessfully persisting the session' do
-      before do
-        allow(store).to receive(:redis).and_raise(Redis::CannotConnectError)
-      end
-
-      it 'returns false' do
-        expect(store.send(:set_session, env, session_id, session_data, options))
-          .to eq(false)
-      end
-    end
-
-    context 'when no expire_after option is given' do
-      let(:options) { {} }
-
-      it 'sets the session value without expiry' do
-        expect(store.send(:set_session, env, session_id, session_data, options))
-          .to eq(session_id)
-      end
-    end
-
-    context 'when redis is down' do
-      before do
-        allow(store).to receive(:redis).and_raise(Redis::CannotConnectError)
-        store.on_redis_down = ->(*_a) { @redis_down_handled = true }
-      end
-
-      it 'returns false' do
-        expect(store.send(:set_session, env, session_id, session_data, options))
-          .to eq(false)
-      end
-
-      it 'calls the on_redis_down handler' do
-        store.send(:set_session, env, session_id, session_data, options)
-        expect(@redis_down_handled).to eq(true)
-      end
-
-      context 'when :on_redis_down re-raises' do
-        before { store.on_redis_down = ->(e, *) { raise e } }
-
-        it 'explodes' do
-          expect do
-            store.send(:set_session, env, session_id, session_data, options)
-          end.to raise_error(Redis::CannotConnectError)
-        end
-      end
-    end
+    it 'does nothing if session has not been changed'
   end
 
   describe 'checking for session existence' do
@@ -251,14 +196,14 @@ describe RedisSessionStore do
 
       context 'when session id does not exist in redis' do
         it 'returns false' do
-          expect(redis).to receive(:exists).with('foo').and_return(false)
+          expect(redis).to receive(:exists?).with('foo').and_return(false)
           expect(store.send(:session_exists?, :env)).to eq(false)
         end
       end
 
       context 'when session id exists in redis' do
         it 'returns true' do
-          expect(redis).to receive(:exists).with('foo').and_return(true)
+          expect(redis).to receive(:exists?).with('foo').and_return(true)
           expect(store.send(:session_exists?, :env)).to eq(true)
         end
       end
@@ -412,21 +357,6 @@ describe RedisSessionStore do
       let(:encoded_data) { '{"some":"data"}' }
 
       it_should_behave_like 'serializer'
-    end
-
-    context 'hybrid' do
-      let(:options) { { serializer: :hybrid } }
-      let(:expected_encoding) { '{"some":"data"}' }
-
-      context 'marshal encoded data' do
-        it_should_behave_like 'serializer'
-      end
-
-      context 'json encoded data' do
-        let(:encoded_data) { '{"some":"data"}' }
-
-        it_should_behave_like 'serializer'
-      end
     end
 
     context 'custom' do

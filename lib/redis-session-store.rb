@@ -1,19 +1,11 @@
 require 'redis'
+require 'rack'
+require 'active_support/core_ext/hash/indifferent_access'
+require 'active_support/core_ext/object'
 
 # Redis session storage for Rails, and for Rails only. Derived from
 # the MemCacheStore code, simply dropping in Redis instead.
 class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
-  VERSION = '0.11.3'.freeze
-  # Rails 3.1 and beyond defines the constant elsewhere
-  unless defined?(ENV_SESSION_OPTIONS_KEY)
-    ENV_SESSION_OPTIONS_KEY = if Rack.release.split('.').first.to_i > 1
-                                Rack::RACK_SESSION_OPTIONS
-                              else
-                                Rack::Session::Abstract::ENV_SESSION_OPTIONS_KEY
-                              end
-  end
-
-  USE_INDIFFERENT_ACCESS = defined?(ActiveSupport).freeze
   # ==== Options
   # * +:key+ - Same as with the other cookie stores, key name
   # * +:redis+ - A hash with redis-specific options
@@ -36,7 +28,7 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   #         url: 'redis://localhost:6379/0'
   #       },
   #       on_redis_down: ->(*a) { logger.error("Redis down! #{a.inspect}") }
-  #       serializer: :hybrid # migrate from Marshal to JSON
+  #       serializer: :json
   #     }
   #
   def initialize(app, options = {})
@@ -67,28 +59,19 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   def session_exists?(env)
     value = current_session_id(env)
 
-    !!(
-      value && !value.empty? &&
-      key_exists?(value)
-    )
+    value.present? && key_exists?(value)
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
-    on_redis_down.call(e, env, value) if on_redis_down
+    on_redis_down&.call(e, env, value)
 
     true
   end
 
   def key_exists?(value)
-    if redis.respond_to?(:exists?)
-      # added in redis gem v4.2
-      redis.exists?(prefixed(value))
-    else
-      # older method, will return an integer starting in redis gem v4.3
-      redis.exists(prefixed(value))
-    end
+    redis.exists?(prefixed(value))
   end
 
   def verify_handlers!
-    %w(on_redis_down on_session_load_error).each do |h|
+    %w[on_redis_down on_session_load_error].each do |h|
       next unless (handler = public_send(h)) && !handler.respond_to?(:call)
 
       raise ArgumentError, "#{h} handler is not callable"
@@ -100,7 +83,7 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   end
 
   def session_default_values
-    [generate_sid, USE_INDIFFERENT_ACCESS ? {}.with_indifferent_access : {}]
+    [generate_sid, {}.with_indifferent_access]
   end
 
   def get_session(env, sid)
@@ -114,7 +97,7 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
       session_default_values
     end
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
-    on_redis_down.call(e, env, sid) if on_redis_down
+    on_redis_down&.call(e, env, sid)
     session_default_values
   end
   alias find_session get_session
@@ -135,14 +118,14 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
       data ? decode(data) : nil
     rescue StandardError => e
       destroy_session_from_sid(sid, drop: true)
-      on_session_load_error.call(e, sid) if on_session_load_error
+      on_session_load_error&.call(e, sid)
       nil
     end
   end
 
   def decode(data)
     session = serializer.load(data)
-    USE_INDIFFERENT_ACCESS ? session.with_indifferent_access : session
+    session.with_indifferent_access
   end
 
   def set_session(env, sid, session_data, options = nil)
@@ -159,13 +142,13 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
     end
     sid
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
-    on_redis_down.call(e, env, sid) if on_redis_down
+    on_redis_down&.call(e, env, sid)
     false
   end
   alias write_session set_session
 
   def get_expiry(env, options)
-    session_storage_options = options || env.fetch(ENV_SESSION_OPTIONS_KEY, {})
+    session_storage_options = options || env.fetch(Rack::RACK_SESSION_OPTIONS, {})
     session_storage_options[:ttl] || session_storage_options[:expire_after]
   end
 
@@ -190,7 +173,7 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
     redis.del(prefixed(sid))
     (options || {})[:drop] ? nil : generate_sid
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
-    on_redis_down.call(e, options[:env] || {}, sid) if on_redis_down
+    on_redis_down&.call(e, options[:env] || {}, sid)
   end
 
   def determine_serializer(serializer)
@@ -198,7 +181,6 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
     case serializer
     when :marshal then Marshal
     when :json    then JsonSerializer
-    when :hybrid  then HybridSerializer
     else serializer
     end
   end
@@ -211,23 +193,6 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
 
     def self.dump(value)
       JSON.generate(value, quirks_mode: true)
-    end
-  end
-
-  # Transparently migrates existing session values from Marshal to JSON
-  class HybridSerializer < JsonSerializer
-    MARSHAL_SIGNATURE = "\x04\x08".freeze
-
-    def self.load(value)
-      if needs_migration?(value)
-        Marshal.load(value)
-      else
-        super
-      end
-    end
-
-    def self.needs_migration?(value)
-      value.start_with?(MARSHAL_SIGNATURE)
     end
   end
 end

@@ -12,11 +12,12 @@ Gem::Specification.new do |gem|
 
   gem.files = `git ls-files -z`.split("\x0")
   gem.require_paths = %w(lib)
-  gem.version = File.read('lib/redis-session-store.rb')
-                    .match(/^  VERSION = '(.*)'/)[1]
+  gem.version = '1.0.0'
 
   gem.add_runtime_dependency 'actionpack', '>= 3', '< 7'
+  gem.add_runtime_dependency 'activesupport', '>= 3', '< 7'
   gem.add_runtime_dependency 'redis', '>= 3', '< 5'
+  gem.add_runtime_dependency 'rack', '~> 2.0'
 
   gem.add_development_dependency 'fakeredis', '~> 0.8'
   gem.add_development_dependency 'rake', '~> 13'
