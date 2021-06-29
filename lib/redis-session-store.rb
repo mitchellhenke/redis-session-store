@@ -24,6 +24,7 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   # * +:on_redis_down:+ - Called with err, env, and SID on Errno::ECONNREFUSED
   # * +:on_session_load_error:+ - Called with err and SID on Marshal.load fail
   # * +:serializer:+ - Serializer to use on session data, default is :marshal.
+  # * +:skip_identical_write:+ Boolean, saving of initial session state
   #
   # ==== Examples
   #
@@ -49,6 +50,7 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
     @on_redis_down = options[:on_redis_down]
     @serializer = determine_serializer(options[:serializer])
     @on_session_load_error = options[:on_session_load_error]
+    @skip_identical_write = options[:skip_identical_write]
     verify_handlers!
   end
 
@@ -102,12 +104,30 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   end
 
   def get_session(env, sid)
-    sid && (session = load_session_from_redis(sid)) ? [sid, session] : session_default_values
+    return session_default_values unless sid
+
+    session = load_session_from_redis(sid)
+    if session
+      session = session_data(sid, session)
+      [sid, session]
+    else
+      session_default_values
+    end
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
     on_redis_down.call(e, env, sid) if on_redis_down
     session_default_values
   end
   alias find_session get_session
+
+  def session_data(sid, session_data)
+    if @skip_identical_write
+      session_with_initial_state = session_data.clone
+      session_with_initial_state['session_initial_state'] = session_data
+      session_with_initial_state
+    else
+      session_data
+    end
+  end
 
   def load_session_from_redis(sid)
     data = redis.get(prefixed(sid))
@@ -126,6 +146,11 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   end
 
   def set_session(env, sid, session_data, options = nil)
+    if @skip_identical_write
+      session_initial = session_data.delete 'session_initial_state'
+      return sid if session_initial == session_data
+    end
+
     expiry = get_expiry(env, options)
     if expiry
       redis.setex(prefixed(sid), expiry, encode(session_data))
