@@ -21,6 +21,7 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   #   * +:key_prefix+ - Prefix for keys used in Redis, e.g. +myapp:+
   #   * +:expire_after+ - A number in seconds for session timeout
   #   * +:client+ - Connect to Redis with given object rather than create one
+  #   * +:client_pool:+ - Connect to Redis with a ConnectionPool
   # * +:on_redis_down:+ - Called with err, env, and SID on Errno::ECONNREFUSED
   # * +:on_session_load_error:+ - Called with err and SID on Marshal.load fail
   # * +:serializer:+ - Serializer to use on session data, default is :marshal.
@@ -42,8 +43,13 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
 
     @default_options[:namespace] = 'rack:session'
     @default_options.merge!(options[:redis] || {})
-    init_options = options[:redis]&.reject { |k, _v| %i[expire_after key_prefix].include?(k) } || {}
-    @redis = init_options[:client] || Redis.new(init_options)
+    redis_options = options[:redis] || {}
+    if redis_options[:client_pool]
+      @redis_pool = redis_options[:client_pool]
+    else
+      init_options = redis_options.reject { |k, _v| %i[expire_after key_prefix].include?(k) } || {}
+      @single_redis = init_options[:client] || Redis.new(init_options)
+    end
     @on_redis_down = options[:on_redis_down]
     @serializer = determine_serializer(options[:serializer])
     @on_session_load_error = options[:on_session_load_error]
@@ -54,7 +60,7 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
 
   private
 
-  attr_reader :redis, :key, :default_options, :serializer
+  attr_reader :redis_pool, :single_redis, :key, :default_options, :serializer
 
   # overrides method defined in rack to actually verify session existence
   # Prevents needless new sessions from being created in scenario where
@@ -63,17 +69,19 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   def session_exists?(env)
     value = current_session_id(env)
 
-    !!(
-      value && !value.empty? &&
-      key_exists?(value)
-    )
+    with_redis do |redis|
+      !!(
+        value && !value.empty? &&
+        key_exists?(value, redis: redis)
+      )
+    end
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
     on_redis_down.call(e, env, value) if on_redis_down
 
     true
   end
 
-  def key_exists?(value)
+  def key_exists?(value, redis:)
     if redis.respond_to?(:exists?)
       # added in redis gem v4.2
       redis.exists?(prefixed(value))
@@ -108,7 +116,10 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   alias find_session get_session
 
   def load_session_from_redis(sid)
-    data = redis.get(prefixed(sid))
+    data = with_redis do |redis|
+      redis.get(prefixed(sid))
+    end
+
     begin
       data ? decode(data) : nil
     rescue StandardError => e
@@ -125,10 +136,12 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
 
   def set_session(env, sid, session_data, options = nil)
     expiry = get_expiry(env, options)
-    if expiry
-      redis.setex(prefixed(sid), expiry, encode(session_data))
-    else
-      redis.set(prefixed(sid), encode(session_data))
+    with_redis do |redis|
+      if expiry
+        redis.setex(prefixed(sid), expiry, encode(session_data))
+      else
+        redis.set(prefixed(sid), encode(session_data))
+      end
     end
     sid
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
@@ -160,7 +173,9 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   end
 
   def destroy_session_from_sid(sid, options = {})
-    redis.del(prefixed(sid))
+    with_redis do |redis|
+      redis.del(prefixed(sid))
+    end
     (options || {})[:drop] ? nil : generate_sid
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
     on_redis_down.call(e, options[:env] || {}, sid) if on_redis_down
@@ -173,6 +188,18 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
     when :json    then JsonSerializer
     when :hybrid  then HybridSerializer
     else serializer
+    end
+  end
+
+  # Consistent interface for a redis instance from a pool
+  # @yield [Redis]
+  def with_redis
+    if redis_pool
+      redis_pool.with do |redis|
+        yield redis
+      end
+    else
+      yield single_redis
     end
   end
 
