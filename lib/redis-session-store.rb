@@ -69,25 +69,25 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   def session_exists?(env)
     value = current_session_id(env)
 
-    with_redis do |redis|
-      !!(
-        value && !value.empty? &&
-        key_exists?(value, redis: redis)
-      )
-    end
+    !!(
+      value && !value.empty? &&
+      key_exists?(value)
+    )
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
     on_redis_down.call(e, env, value) if on_redis_down
 
     true
   end
 
-  def key_exists?(value, redis:)
-    if redis.respond_to?(:exists?)
-      # added in redis gem v4.2
-      redis.exists?(prefixed(value))
-    else
-      # older method, will return an integer starting in redis gem v4.3
-      redis.exists(prefixed(value))
+  def key_exists?(value)
+    with_redis do |redis|
+      if redis.respond_to?(:exists?)
+        # added in redis gem v4.2
+        redis.exists?(prefixed(value))
+      else
+        # older method, will return an integer starting in redis gem v4.3
+        redis.exists(prefixed(value))
+      end
     end
   end
 
