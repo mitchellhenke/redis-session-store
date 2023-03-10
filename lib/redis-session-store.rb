@@ -53,6 +53,8 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
     @on_redis_down = options[:on_redis_down]
     @serializer = determine_serializer(options[:serializer])
     @on_session_load_error = options[:on_session_load_error]
+    @public_id_read_fallback = options[:public_id_read_fallback]
+    @public_id_write_fallback = options[:public_id_read_fallback]
     verify_handlers!
   end
 
@@ -100,11 +102,34 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   end
 
   def prefixed(sid)
-    "#{default_options[:key_prefix]}#{sid}"
+    return unless sid.respond_to?(:private_id)
+    "#{default_options[:key_prefix]}#{sid.private_id}"
+  end
+
+  def prefixed_fallback(sid)
+    "#{default_options[:key_prefix]}#{sid.public_id}"
   end
 
   def session_default_values
-    [generate_sid, USE_INDIFFERENT_ACCESS ? {}.with_indifferent_access : {}]
+    new_session_hash = {
+      session_initialized: true,
+    }
+    new_session_hash = USE_INDIFFERENT_ACCESS ? new_session_hash.with_indifferent_access : new_session_hash
+    [generate_new_sid, new_session_hash]
+  end
+
+  def generate_new_sid
+    loop do
+      raw_sid = generate_sid
+      sid = raw_sid.is_a?(String) ? Rack::Session::SessionId.new(raw_sid) : raw_sid
+      key = prefixed(sid)
+      if public_id_read_fallback || public_id_write_fallback
+        fallback_key = prefixed_fallback(sid)
+        break sid unless (key && key_exists?(key)) || (fallback_key && key_exists(fallback_key))
+      else
+        break sid unless key && key_exists?(key)
+      end
+    end
   end
 
   def get_session(env, sid)
@@ -135,6 +160,14 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   end
 
   def set_session(env, sid, session_data, options = nil)
+    return false unless sid
+    key = if public_id_write_fallback
+            prefixed_fallback(sid)
+          else
+            prefixed(sid)
+          end
+    return false unless key
+
     expiry = get_expiry(env, options)
     with_redis do |redis|
       if expiry
@@ -166,7 +199,7 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
 
   def destroy(env)
     if env['rack.request.cookie_hash'] &&
-       (sid = env['rack.request.cookie_hash'][key])
+        (sid = env['rack.request.cookie_hash'][key])
       destroy_session_from_sid(sid, drop: true, env: env)
     end
     false
