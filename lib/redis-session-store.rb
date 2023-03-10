@@ -47,6 +47,8 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
     @on_redis_down = options[:on_redis_down]
     @serializer = determine_serializer(options[:serializer])
     @on_session_load_error = options[:on_session_load_error]
+    @public_id_read_fallback = options[:public_id_read_fallback]
+    @public_id_write_fallback = options[:public_id_read_fallback]
     verify_handlers!
   end
 
@@ -54,32 +56,15 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
 
   private
 
-  attr_reader :redis, :key, :default_options, :serializer
+  attr_reader :redis, :key, :default_options, :serializer, :public_id_read_fallback, :public_id_write_fallback
 
-  # overrides method defined in rack to actually verify session existence
-  # Prevents needless new sessions from being created in scenario where
-  # user HAS session id, but it already expired, or is invalid for some
-  # other reason, and session was accessed only for reading.
-  def session_exists?(env)
-    value = current_session_id(env)
-
-    !!(
-      value && !value.empty? &&
-      key_exists?(value)
-    )
-  rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
-    on_redis_down.call(e, env, value) if on_redis_down
-
-    true
-  end
-
-  def key_exists?(value)
+  def key_exists?(key)
     if redis.respond_to?(:exists?)
       # added in redis gem v4.2
-      redis.exists?(prefixed(value))
+      redis.exists?(key)
     else
       # older method, will return an integer starting in redis gem v4.3
-      redis.exists(prefixed(value))
+      redis.exists(key)
     end
   end
 
@@ -92,11 +77,30 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   end
 
   def prefixed(sid)
-    "#{default_options[:key_prefix]}#{sid}"
+    return unless sid.respond_to?(:private_id)
+    "#{default_options[:key_prefix]}#{sid.private_id}"
+  end
+
+  def prefixed_fallback(sid)
+    "#{default_options[:key_prefix]}#{sid.public_id}"
   end
 
   def session_default_values
-    [generate_sid, USE_INDIFFERENT_ACCESS ? {}.with_indifferent_access : {}]
+    [generate_new_sid, USE_INDIFFERENT_ACCESS ? {}.with_indifferent_access : {}]
+  end
+
+  def generate_new_sid
+    loop do
+      raw_sid = generate_sid
+      sid = raw_sid.is_a?(String) ? Rack::Session::SessionId.new(raw_sid) : raw_sid
+      key = prefixed(sid)
+      if public_id_read_fallback || public_id_write_fallback
+        fallback_key = prefixed_fallback(sid)
+        break sid unless (key && key_exists?(key)) || (fallback_key && key_exists(fallback_key))
+      else
+        break sid unless key && key_exists?(key)
+      end
+    end
   end
 
   def get_session(env, sid)
@@ -108,7 +112,12 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   alias find_session get_session
 
   def load_session_from_redis(sid)
-    data = redis.get(prefixed(sid))
+    key = prefixed(sid)
+    data = redis.get(key)
+    if public_id_read_fallback && data.nil?
+      fallback_key = prefixed_fallback(sid)
+      data = redis.get(fallback_key)
+    end
     begin
       data ? decode(data) : nil
     rescue StandardError => e
@@ -124,11 +133,19 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
   end
 
   def set_session(env, sid, session_data, options = nil)
+    return false unless sid
+    key = if public_id_write_fallback
+            prefixed_fallback(sid)
+          else
+            prefixed(sid)
+          end
+    return false unless key
+
     expiry = get_expiry(env, options)
     if expiry
-      redis.setex(prefixed(sid), expiry, encode(session_data))
+      redis.setex(key, expiry, encode(session_data))
     else
-      redis.set(prefixed(sid), encode(session_data))
+      redis.set(key, encode(session_data))
     end
     sid
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
@@ -153,14 +170,19 @@ class RedisSessionStore < ActionDispatch::Session::AbstractSecureStore
 
   def destroy(env)
     if env['rack.request.cookie_hash'] &&
-       (sid = env['rack.request.cookie_hash'][key])
+        (sid = env['rack.request.cookie_hash'][key])
       destroy_session_from_sid(sid, drop: true, env: env)
     end
     false
   end
 
   def destroy_session_from_sid(sid, options = {})
-    redis.del(prefixed(sid))
+    key = prefixed(sid)
+    redis.del(key)
+    if public_id_read_fallback || public_id_write_fallback
+      fallback_key = prefixed_fallback(sid)
+      redis.del(fallback_key)
+    end
     (options || {})[:drop] ? nil : generate_sid
   rescue Errno::ECONNREFUSED, Redis::CannotConnectError => e
     on_redis_down.call(e, options[:env] || {}, sid) if on_redis_down
