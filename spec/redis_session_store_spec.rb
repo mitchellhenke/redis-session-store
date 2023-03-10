@@ -1,4 +1,5 @@
 require 'json'
+require 'connection_pool'
 
 describe RedisSessionStore do
   subject(:store) { described_class.new(nil, options) }
@@ -34,7 +35,7 @@ describe RedisSessionStore do
     end
 
     it 'creates a redis instance' do
-      expect(store.instance_variable_get(:@redis)).not_to be_nil
+      expect(store.instance_variable_get(:@single_redis)).not_to be_nil
     end
 
     it 'assigns the :host option to @default_options' do
@@ -55,6 +56,23 @@ describe RedisSessionStore do
 
     it 'assigns the :expire_after option to @default_options' do
       expect(default_options[:expire_after]).to eq(60 * 120)
+    end
+
+    context 'with a :client_pool' do
+      let :options do
+        {
+          key: random_string,
+          secret: random_string,
+          redis: {
+            client_pool: ConnectionPool.new(size: 2) { double('redis') }
+          }
+        }
+      end
+
+      it 'assigns the pool to @redis_pool' do
+        expect(store.instance_variable_get(:@redis_pool)).
+          to eq(options[:redis][:client_pool])
+      end
     end
   end
 
@@ -95,7 +113,7 @@ describe RedisSessionStore do
     end
 
     it 'creates a redis instance' do
-      expect(store.instance_variable_get(:@redis)).not_to be_nil
+      expect(store.instance_variable_get(:@single_redis)).not_to be_nil
     end
 
     it 'assigns the :host option to @default_options' do
@@ -134,8 +152,8 @@ describe RedisSessionStore do
 
     let(:redis_client) { double('redis_client') }
 
-    it 'assigns given redis object to @redis' do
-      expect(store.instance_variable_get(:@redis)).to be(redis_client)
+    it 'assigns given redis object to @single_redis' do
+      expect(store.instance_variable_get(:@single_redis)).to be(redis_client)
     end
 
     it 'assigns the :client option to @default_options' do
@@ -170,7 +188,7 @@ describe RedisSessionStore do
 
     context 'when unsuccessfully persisting the session' do
       before do
-        allow(store).to receive(:redis).and_raise(Redis::CannotConnectError)
+        allow(store).to receive(:single_redis).and_raise(Redis::CannotConnectError)
       end
 
       it 'returns false' do
@@ -190,7 +208,7 @@ describe RedisSessionStore do
 
     context 'when redis is down' do
       before do
-        allow(store).to receive(:redis).and_raise(Redis::CannotConnectError)
+        allow(store).to receive(:single_redis).and_raise(Redis::CannotConnectError)
         store.on_redis_down = ->(*_a) { @redis_down_handled = true }
       end
 
@@ -246,7 +264,7 @@ describe RedisSessionStore do
     context 'when session id is provided' do
       let(:redis) do
         double('redis').tap do |o|
-          allow(store).to receive(:redis).and_return(o)
+          allow(store).to receive(:single_redis).and_return(o)
         end
       end
 
@@ -266,7 +284,7 @@ describe RedisSessionStore do
 
       context 'when redis is down' do
         it 'returns true (fallback to old behavior)' do
-          allow(store).to receive(:redis).and_raise(Redis::CannotConnectError)
+          allow(store).to receive(:with_redis).and_raise(Redis::CannotConnectError)
           expect(store.send(:session_exists?, :env)).to eq(true)
         end
       end
@@ -291,7 +309,7 @@ describe RedisSessionStore do
 
     it 'retrieves the prefixed key from redis' do
       redis = double('redis')
-      allow(store).to receive(:redis).and_return(redis)
+      allow(store).to receive(:single_redis).and_return(redis)
       allow(store).to receive(:generate_sid).and_return(fake_key)
       expect(redis).to receive(:get).with("#{options[:key_prefix]}#{fake_key}")
 
@@ -300,7 +318,7 @@ describe RedisSessionStore do
 
     context 'when redis is down' do
       before do
-        allow(store).to receive(:redis).and_raise(Redis::CannotConnectError)
+        allow(store).to receive(:single_redis).and_raise(Redis::CannotConnectError)
         allow(store).to receive(:generate_sid).and_return('foop')
       end
 
@@ -338,7 +356,7 @@ describe RedisSessionStore do
 
       it 'deletes the prefixed key from redis' do
         redis = double('redis')
-        allow(store).to receive(:redis).and_return(redis)
+        allow(store).to receive(:single_redis).and_return(redis)
         expect(redis).to receive(:del)
           .with("#{options[:key_prefix]}#{fake_key}")
 
@@ -347,7 +365,7 @@ describe RedisSessionStore do
 
       context 'when redis is down' do
         before do
-          allow(store).to receive(:redis).and_raise(Redis::CannotConnectError)
+          allow(store).to receive(:single_redis).and_raise(Redis::CannotConnectError)
         end
 
         it 'returns false' do
@@ -369,7 +387,7 @@ describe RedisSessionStore do
     context 'when destroyed via #destroy_session' do
       it 'deletes the prefixed key from redis' do
         redis = double('redis', setnx: true)
-        allow(store).to receive(:redis).and_return(redis)
+        allow(store).to receive(:single_redis).and_return(redis)
         sid = store.send(:generate_sid)
         expect(redis).to receive(:del).with("#{options[:key_prefix]}#{sid}")
 
@@ -388,7 +406,7 @@ describe RedisSessionStore do
     let(:expected_encoding) { encoded_data }
 
     before do
-      allow(store).to receive(:redis).and_return(redis)
+      allow(store).to receive(:single_redis).and_return(redis)
     end
 
     shared_examples_for 'serializer' do
@@ -454,7 +472,7 @@ describe RedisSessionStore do
   describe 'handling decode errors' do
     context 'when a class is serialized that does not exist' do
       before do
-        allow(store).to receive(:redis)
+        allow(store).to receive(:single_redis)
           .and_return(double('redis',
                              get: "\x04\bo:\nNonExistentClass\x00",
                              del: true))
@@ -488,7 +506,7 @@ describe RedisSessionStore do
 
     context 'when the encoded data is invalid' do
       before do
-        allow(store).to receive(:redis)
+        allow(store).to receive(:single_redis)
           .and_return(double('redis', get: "\x00\x00\x00\x00", del: true))
       end
 
@@ -549,7 +567,7 @@ describe RedisSessionStore do
     it 'allows changing the session' do
       env = { 'rack.session.options' => {} }
       sid = 1234
-      allow(store).to receive(:redis).and_return(Redis.new)
+      allow(store).to receive(:single_redis).and_return(Redis.new)
       data1 = { 'foo' => 'bar' }
       store.send(:set_session, env, sid, data1)
       data2 = { 'baz' => 'wat' }
@@ -561,7 +579,7 @@ describe RedisSessionStore do
     it 'allows changing the session when the session has an expiry' do
       env = { 'rack.session.options' => { expire_after: 60 } }
       sid = 1234
-      allow(store).to receive(:redis).and_return(Redis.new)
+      allow(store).to receive(:single_redis).and_return(Redis.new)
       data1 = { 'foo' => 'bar' }
       store.send(:set_session, env, sid, data1)
       data2 = { 'baz' => 'wat' }

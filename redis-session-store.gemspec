@@ -18,6 +18,7 @@ Gem::Specification.new do |gem|
   gem.add_runtime_dependency 'actionpack', '>= 6', '< 8'
   gem.add_runtime_dependency 'redis', '>= 3', '< 6'
 
+  gem.add_development_dependency 'connection_pool', '~> 2'
   gem.add_development_dependency 'fakeredis', '~> 0.8'
   gem.add_development_dependency 'rake', '~> 13'
   gem.add_development_dependency 'rspec', '~> 3'
